@@ -1,44 +1,79 @@
 name: release
 
+# Build native binaries for Windows, Linux, macOS (x86_64 + Apple Silicon),
+# generate SHA256 checksums, and publish a GitHub release on every v* tag.
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    name: build (${{ matrix.os }})
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, artifact: agentrr-x86_64-linux }
-          - { os: windows-latest, artifact: agentrr-x86_64-windows }
-          - { os: macos-latest, artifact: agentrr-aarch64-macos }
-    runs-on: ${{ matrix.os }}
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, artifact: agentrr-x86_64-linux,    archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   artifact: agentrr-x86_64-windows, archive: zip }
+          - { os: macos-13,       target: x86_64-apple-darwin,       artifact: agentrr-x86_64-macos,   archive: tar.gz }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      artifact: agentrr-aarch64-macos,  archive: tar.gz }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
       - name: Build release
-        run: cargo build --release -p agentrr-cli
-      - name: Stage binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p agentrr-cli
+
+      - name: Package
         shell: bash
         run: |
+          set -euo pipefail
+          EXT=""
+          if [ "${{ matrix.archive }}" = "zip" ]; then EXT=".exe"; fi
+          BIN="target/${{ matrix.target }}/release/agentrr${EXT}"
           mkdir -p stage
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp target/release/agentrr.exe stage/agentrr.exe
+          cp "$BIN" "stage/${{ matrix.artifact }}${EXT}"
+          cd stage
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "../${{ matrix.artifact }}.zip" "${{ matrix.artifact }}${EXT}"
           else
-            cp target/release/agentrr stage/agentrr
+            tar czf "../${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
           fi
+          cd ..
+          # Per-file checksum (computed on the runner that produced it).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}.${{ matrix.archive }}" > "${{ matrix.artifact }}.${{ matrix.archive }}.sha256"
+          else
+            certutil -hashfile "${{ matrix.artifact }}.${{ matrix.archive }}" SHA256 | grep -v -i hash > "${{ matrix.artifact }}.${{ matrix.archive }}.sha256"
+          fi
+          ls -la
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: stage/*
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip.sha256
+            ${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: ignore
 
   release:
+    name: publish release + SHA256SUMS
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -47,16 +82,31 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Zip Windows artifact
+          merge-multiple: true
+
+      - name: Assemble release dir + checksums
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
-          (cd dist/agentrr-x86_64-windows && zip -q ../../out/agentrr-x86_64-windows.zip agentrr.exe) || true
-          cp dist/agentrr-x86_64-linux/agentrr out/agentrr-x86_64-linux || true
-          cp dist/agentrr-aarch64-macos/agentrr out/agentrr-aarch64-macos || true
+          # Move the archives into out/ (ignore per-file .sha256, we rebuild a single sum file).
+          find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} out/ \;
+          cd out
+          echo "=== artifacts ==="
+          ls -la
+          echo "=== computing SHA256SUMS.txt ==="
+          sha256sum *.zip *.tar.gz | tee SHA256SUMS.txt
+          echo "=== contents ==="
+          cat SHA256SUMS.txt
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: out/*
+          files: |
+            out/*.zip
+            out/*.tar.gz
+            out/SHA256SUMS.txt
           generate_release_notes: true
-          draft: true
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
