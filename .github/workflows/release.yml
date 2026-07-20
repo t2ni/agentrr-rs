@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, artifact: agentrr-x86_64-linux }
+          - { os: windows-latest, artifact: agentrr-x86_64-windows }
+          - { os: macos-latest, artifact: agentrr-aarch64-macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release -p agentrr-cli
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p stage
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/agentrr.exe stage/agentrr.exe
+          else
+            cp target/release/agentrr stage/agentrr
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: stage/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Zip Windows artifact
+        run: |
+          mkdir -p out
+          (cd dist/agentrr-x86_64-windows && zip -q ../../out/agentrr-x86_64-windows.zip agentrr.exe) || true
+          cp dist/agentrr-x86_64-linux/agentrr out/agentrr-x86_64-linux || true
+          cp dist/agentrr-aarch64-macos/agentrr out/agentrr-aarch64-macos || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
