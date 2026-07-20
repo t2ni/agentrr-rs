@@ -9,3 +9,8 @@ repository.workspace = true
 description = "Pure domain types for agentrr (Run, Event, Step, manifest, errors)"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }

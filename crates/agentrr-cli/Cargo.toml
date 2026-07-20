@@ -13,3 +13,17 @@ name = "agentrr"
 path = "src/main.rs"
 
 [dependencies]
+agentrr-core = { workspace = true }
+agentrr-store = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+comfy-table = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+agentrr-core = { workspace = true }
+agentrr-store = { workspace = true }
+serde_json = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }

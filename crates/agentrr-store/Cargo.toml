@@ -9,3 +9,11 @@ repository.workspace = true
 description = "SQLite + BLAKE3 content-addressed blob store for agentrr runs"
 
 [dependencies]
+agentrr-core = { workspace = true }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
