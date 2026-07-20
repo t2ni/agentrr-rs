@@ -1,18 +1,19 @@
 //! `agentrr` CLI — deterministic record & replay for AI agents.
-//!
-//! M1 wires `ls`, `steps`, `show` against the store. Record/replay/etc. land in
-//! later milestones.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use agentrr_core::RunId;
+use agentrr_core::{Event, RunId, RunManifest};
+use agentrr_match::Provider;
+use agentrr_proxy::serve_record;
 use agentrr_store::Store;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
+use tokio::net::TcpListener;
+use url::Url;
 
 #[derive(Parser)]
 #[command(
@@ -38,24 +39,62 @@ enum Command {
     Ls,
     /// List the steps (events) in a run.
     Steps {
-        /// Run id or path.
         #[arg(long)]
         run: String,
     },
     /// Show a run summary, or the event at `--step`.
     Show {
-        /// Run id or path.
         #[arg(long)]
         run: String,
-        /// Show a specific step instead of the run summary.
         #[arg(long)]
         step: Option<u64>,
     },
+    /// Start the recording proxy.
+    Record {
+        /// Upstream origin to forward to (e.g. https://api.openai.com). If omitted,
+        /// inferred from --provider.
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Local port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Human label for the run.
+        #[arg(long)]
+        name: Option<String>,
+        /// Provider wire format.
+        #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
+        provider: ProviderArg,
+    },
 }
 
-fn main() -> ExitCode {
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum ProviderArg {
+    Openai,
+    Anthropic,
+    Auto,
+}
+
+impl ProviderArg {
+    fn label(self) -> &'static str {
+        match self {
+            ProviderArg::Openai => "openai",
+            ProviderArg::Anthropic => "anthropic",
+            ProviderArg::Auto => "auto",
+        }
+    }
+    fn as_match(self) -> Option<Provider> {
+        match self {
+            ProviderArg::Openai => Some(Provider::OpenAi),
+            ProviderArg::Anthropic => Some(Provider::Anthropic),
+            ProviderArg::Auto => None,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -64,7 +103,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli) -> Result<()> {
     let store_root = resolve_store(cli.store);
     let store = Store::open(&store_root)
         .with_context(|| format!("opening store at {}", store_root.display()))?;
@@ -72,7 +111,64 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ls => cmd_ls(&store, cli.json),
         Command::Steps { run } => cmd_steps(&store, &run, cli.json),
         Command::Show { run, step } => cmd_show(&store, &run, step, cli.json),
+        Command::Record {
+            upstream,
+            port,
+            name,
+            provider,
+        } => cmd_record(&store, upstream, port, name, provider).await,
     }
+}
+
+async fn cmd_record(
+    store: &Store,
+    upstream: Option<String>,
+    port: u16,
+    name: Option<String>,
+    provider: ProviderArg,
+) -> Result<()> {
+    let upstream_url = resolve_upstream(upstream, provider)?;
+
+    let mut manifest = RunManifest::new()?;
+    manifest.name = name.clone();
+    manifest.provider = Some(provider.label().to_string());
+    let writer = store.create_run(manifest)?;
+    let run_id = writer.id();
+    let run_dir = store.run_dir(&run_id);
+
+    println!("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1");
+    println!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    eprintln!("# run_id: {run_id}");
+    eprintln!("# recording -> {}", run_dir.display());
+    eprintln!("# upstream: {upstream_url}");
+    eprintln!("# (Ctrl-C to stop and finalize the run)");
+
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+
+    let manifest = serve_record(upstream_url, provider.as_match(), listener, writer, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+
+    eprintln!(
+        "# stopped. saved {} events to {}",
+        manifest.event_count,
+        run_dir.display()
+    );
+    Ok(())
+}
+
+fn resolve_upstream(upstream: Option<String>, provider: ProviderArg) -> Result<Url> {
+    let raw = match upstream {
+        Some(u) => u,
+        None => match provider {
+            ProviderArg::Anthropic => "https://api.anthropic.com".to_string(),
+            _ => "https://api.openai.com".to_string(),
+        },
+    };
+    Url::parse(&raw).with_context(|| format!("parsing upstream URL {raw:?}"))
 }
 
 fn cmd_ls(store: &Store, json: bool) -> Result<()> {
@@ -164,7 +260,7 @@ fn cmd_show(store: &Store, run: &str, step: Option<u64>, json: bool) -> Result<(
     Ok(())
 }
 
-fn print_event(ev: &agentrr_core::Event) {
+fn print_event(ev: &Event) {
     println!("step      {}", ev.step.get());
     println!("kind      {}", ev.kind.as_str());
     println!("mono_ns   {}", ev.ts_mono_ns);
@@ -206,7 +302,6 @@ fn home_dir() -> PathBuf {
 }
 
 fn short_id(id: &RunId) -> String {
-    // Show the full UUIDv7 — it's already compact (36 chars) and is the dir name.
     id.to_string()
 }
 

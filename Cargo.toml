@@ -45,6 +45,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
+url = "2"
+bytes = "1"
 
 # data
 serde = { version = "1", features = ["derive"] }

@@ -9,3 +9,18 @@ repository.workspace = true
 description = "OpenAI/Anthropic-compatible reverse proxy for agentrr (record & replay)"
 
 [dependencies]
+agentrr-core = { workspace = true }
+agentrr-store = { workspace = true }
+agentrr-match = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
