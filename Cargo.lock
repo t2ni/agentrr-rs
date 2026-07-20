@@ -74,6 +74,12 @@ dependencies = [
 [[package]]
 name = "agentrr-sdk"
 version = "0.1.0"
+dependencies = [
+ "agentrr-core",
+ "agentrr-store",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "agentrr-store"
