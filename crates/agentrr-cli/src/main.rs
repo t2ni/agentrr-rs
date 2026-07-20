@@ -80,6 +80,9 @@ enum Command {
         /// Provider wire format.
         #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
         provider: ProviderArg,
+        /// Re-produce recorded inter-chunk delays for streamed responses.
+        #[arg(long, default_value_t = false)]
+        realtime: bool,
     },
     /// Re-run a run against itself and assert byte-identical, deterministic replay.
     Verify {
@@ -181,7 +184,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             on_miss,
             upstream,
             provider,
-        } => cmd_replay(&store, &run, port, on_miss, upstream, provider).await,
+            realtime,
+        } => cmd_replay(&store, &run, port, on_miss, upstream, provider, realtime).await,
         Command::Verify { run } => cmd_verify(&store, &run),
     }
 }
@@ -233,6 +237,7 @@ async fn cmd_replay(
     on_miss: OnMissArg,
     upstream: Option<String>,
     provider: ProviderArg,
+    realtime: bool,
 ) -> Result<(), CliError> {
     let id = store.resolve(run).map_err(|e| anyhow::anyhow!("{e}"))?;
     let upstream_url = match upstream {
@@ -259,6 +264,7 @@ async fn cmd_replay(
             match_mode: MatchMode::Strict,
             provider_override: provider.as_match(),
             upstream: upstream_url,
+            realtime,
         },
         listener,
         async {

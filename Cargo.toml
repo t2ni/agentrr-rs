@@ -51,6 +51,8 @@ bytes = "1"
 # data
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures-util = "0.3"
+async-stream = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 uuid = { version = "1", features = ["v7", "serde"] }

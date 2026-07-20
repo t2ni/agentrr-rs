@@ -15,11 +15,14 @@ agentrr-match = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
