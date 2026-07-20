@@ -2,13 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use agentrr_core::{Event, RunId, RunManifest};
 use agentrr_match::{MatchMode, Provider};
 use agentrr_proxy::{serve_record, serve_replay, OnMiss, ReplayConfig};
-use agentrr_store::{verify_run, Store};
+use agentrr_store::{diff_runs, verify_run, Store};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -89,6 +89,32 @@ enum Command {
         #[arg(long)]
         run: String,
     },
+    /// Fork a run: copy its prefix, override a step, then continue live.
+    Fork {
+        #[arg(long)]
+        run: String,
+        /// Step index to override (0-based).
+        #[arg(long)]
+        at: u64,
+        /// Override spec JSON: {"response_path": "...", "request_path": "..."}.
+        #[arg(long)]
+        r#override: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        upstream: Option<String>,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
+        provider: ProviderArg,
+    },
+    /// Structural diff of two runs, step by step.
+    Diff {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        against: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -142,6 +168,24 @@ impl From<anyhow::Error> for CliError {
     }
 }
 
+impl From<std::io::Error> for CliError {
+    fn from(e: std::io::Error) -> Self {
+        CliError::Other(e.into())
+    }
+}
+
+impl From<agentrr_core::AgentrrError> for CliError {
+    fn from(e: agentrr_core::AgentrrError) -> Self {
+        CliError::Other(e.into())
+    }
+}
+
+impl From<serde_json::Error> for CliError {
+    fn from(e: serde_json::Error) -> Self {
+        CliError::Other(e.into())
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -187,6 +231,28 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             realtime,
         } => cmd_replay(&store, &run, port, on_miss, upstream, provider, realtime).await,
         Command::Verify { run } => cmd_verify(&store, &run),
+        Command::Fork {
+            run,
+            at,
+            r#override,
+            name,
+            upstream,
+            port,
+            provider,
+        } => {
+            cmd_fork(
+                &store,
+                &run,
+                at,
+                &r#override,
+                name,
+                upstream,
+                port,
+                provider,
+            )
+            .await
+        }
+        Command::Diff { run, against } => cmd_diff(&store, &run, &against, cli.json),
     }
 }
 
@@ -307,6 +373,101 @@ fn cmd_verify(store: &Store, run: &str) -> Result<(), CliError> {
         }
         Err(e) => Err(CliError::Other(anyhow::anyhow!("{e}"))),
     }
+}
+
+#[allow(clippy::too_many_arguments)] // CLI handler — args mirror the clap fields
+async fn cmd_fork(
+    store: &Store,
+    parent: &str,
+    at: u64,
+    override_path: &Path,
+    name: Option<String>,
+    upstream: Option<String>,
+    port: u16,
+    provider: ProviderArg,
+) -> Result<(), CliError> {
+    let parent_id = store.resolve(parent)?;
+    let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(override_path)?)?;
+    let resp = spec
+        .get("response_path")
+        .and_then(|v| v.as_str())
+        .map(std::fs::read)
+        .transpose()?;
+    let req = spec
+        .get("request_path")
+        .and_then(|v| v.as_str())
+        .map(std::fs::read)
+        .transpose()?;
+    if resp.is_none() && req.is_none() {
+        return Err(CliError::Other(anyhow::anyhow!(
+            "override file must set response_path and/or request_path"
+        )));
+    }
+
+    let writer = store.fork_from(&parent_id, at, resp.as_deref(), req.as_deref())?;
+    let run_id = writer.id();
+    let run_dir = store.run_dir(&run_id);
+
+    println!("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1");
+    println!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    eprintln!("# forked {parent_id} @ step {at} -> {run_id}");
+    if let Some(n) = &name {
+        eprintln!("# name: {n}");
+    }
+    eprintln!(
+        "# recording live tail from step {} (Ctrl-C to finalize)",
+        at + 1
+    );
+
+    let upstream_url = resolve_upstream(upstream, provider)?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| anyhow::anyhow!("bind 127.0.0.1:{port}: {e}"))?;
+    let manifest = serve_record(upstream_url, provider.as_match(), listener, writer, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+    eprintln!(
+        "# fork run saved: {} events total -> {}",
+        manifest.event_count,
+        run_dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_diff(store: &Store, a: &str, b: &str, json: bool) -> Result<(), CliError> {
+    let aid = store.resolve(a)?;
+    let bid = store.resolve(b)?;
+    let ra = store.open_run(&aid)?;
+    let rb = store.open_run(&bid)?;
+    let diff = diff_runs(&ra, &rb)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+        return Ok(());
+    }
+    if diff.identical {
+        println!("runs identical ({} steps each)", diff.a_count);
+        return Ok(());
+    }
+    let mut t = Table::new();
+    t.set_content_arrangement(ContentArrangement::Dynamic);
+    t.set_header(vec!["STEP", "STATUS", "NOTE"]);
+    let mut shown = 0;
+    for s in &diff.steps {
+        if !s.identical {
+            t.add_row(vec![s.step.to_string(), "DIFF".into(), s.note.clone()]);
+            shown += 1;
+        }
+    }
+    if shown == 0 {
+        println!(
+            "runs differ in length only: A={} steps, B={} steps",
+            diff.a_count, diff.b_count
+        );
+    } else {
+        println!("{t}");
+    }
+    Ok(())
 }
 
 fn resolve_upstream(upstream: Option<String>, provider: ProviderArg) -> Result<Url> {

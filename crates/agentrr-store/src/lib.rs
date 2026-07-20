@@ -24,9 +24,10 @@ use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentrr_core::{AgentrrError, Event, EventKind, RunId, RunManifest, Step, SCHEMA_VERSION};
-use agentrr_match::ReplayCursor;
+use agentrr_match::{match_key, MatchMode, Provider, ReplayCursor};
 use regex::Regex;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 
 // --------------------------------------------------------------------------- //
 // Store
@@ -119,6 +120,65 @@ impl Store {
         let blobs_dir = dir.join("blobs");
         let mut writer = RunWriter::new(dir, blobs_dir, conn, manifest)?;
         writer.next_step = (max_step + 1).max(0) as u64;
+        Ok(writer)
+    }
+
+    /// Fork `parent_id` into a new run: copy events `[0, at)` verbatim, apply an
+    /// override at step `at`, and return an open writer positioned at step `at+1`
+    /// ready to record the live tail. Blobs are copied so the fork is
+    /// self-contained.
+    pub fn fork_from(
+        &self,
+        parent_id: &RunId,
+        at: u64,
+        override_resp: Option<&[u8]>,
+        override_req: Option<&[u8]>,
+    ) -> Result<RunWriter, AgentrrError> {
+        let parent = self.open_run(parent_id)?;
+        let parent_events = parent.events()?;
+        let at_idx = at as usize;
+        if at_idx >= parent_events.len() {
+            return Err(AgentrrError::Other(format!(
+                "fork point {at} out of range (parent has {} events)",
+                parent_events.len()
+            )));
+        }
+        let mut manifest = RunManifest::new_fork(*parent_id, Step::new(at))?;
+        manifest.provider = parent.manifest().provider.clone();
+        let mut writer = self.create_run(manifest)?;
+        let src_blobs = parent.blobs_dir().to_path_buf();
+
+        // Prefix [0, at): copy blobs + event rows verbatim.
+        for ev in parent_events.iter().take(at_idx) {
+            copy_blob(&src_blobs, writer.blobs_dir(), ev.request_blob.as_deref())?;
+            copy_blob(&src_blobs, writer.blobs_dir(), ev.response_blob.as_deref())?;
+            writer.write_event(ev.clone())?;
+        }
+
+        // Override step `at`.
+        let mut ov = parent_events[at_idx].clone();
+        if let Some(bytes) = override_resp {
+            ov.response_blob = Some(write_blob(writer.blobs_dir(), bytes)?);
+        }
+        if let Some(bytes) = override_req {
+            ov.request_blob = Some(write_blob(writer.blobs_dir(), bytes)?);
+            let provider = ov
+                .meta
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(parse_provider)
+                .unwrap_or_else(|| Provider::Other("auto".into()));
+            let endpoint = ov
+                .meta
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ov.match_key = Some(content_or_match_key(&provider, endpoint, bytes));
+        }
+        writer.write_event(ov)?;
+
+        // Detach from the parent reader before handing the writer back.
+        drop(parent);
         Ok(writer)
     }
 
@@ -508,6 +568,42 @@ pub fn read_blob(blobs_dir: &Path, hex: &str) -> Result<Vec<u8>, AgentrrError> {
     fs::read(&path).map_err(|e| AgentrrError::Other(format!("blob {hex}: {e}")))
 }
 
+/// Copy a content-addressed blob from `src_blobs` to `dst_blobs` if present.
+fn copy_blob(src_blobs: &Path, dst_blobs: &Path, hex: Option<&str>) -> Result<(), AgentrrError> {
+    if let Some(hex) = hex {
+        validate_hex(hex)?;
+        let src = src_blobs.join(format!("{hex}.bin"));
+        let dst = dst_blobs.join(format!("{hex}.bin"));
+        if src.exists() && !dst.exists() {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_provider(s: &str) -> Provider {
+    match s {
+        "openai" => Provider::OpenAi,
+        "anthropic" => Provider::Anthropic,
+        other => Provider::Other(other.to_string()),
+    }
+}
+
+/// Match key for a request body, falling back to a content hash for non-JSON.
+fn content_or_match_key(provider: &Provider, endpoint: &str, body: &[u8]) -> String {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        match_key(provider, endpoint, &v, MatchMode::Strict)
+    } else {
+        let mut pre = Vec::new();
+        pre.extend_from_slice(provider.as_str().as_bytes());
+        pre.push(0);
+        pre.extend_from_slice(endpoint.as_bytes());
+        pre.push(0);
+        pre.extend_from_slice(body);
+        blake3::hash(&pre).to_hex().to_string()
+    }
+}
+
 fn validate_hex(hex: &str) -> Result<(), AgentrrError> {
     let ok = hex.len() == 64 && hex.as_bytes().iter().all(|b| b.is_ascii_hexdigit());
     if !ok {
@@ -640,6 +736,88 @@ pub fn verify_run(reader: &RunReader) -> Result<VerifyReport, AgentrrError> {
     Ok(VerifyReport {
         events: events.len(),
         keys: seen.len(),
+    })
+}
+
+// --------------------------------------------------------------------------- //
+// Diff
+// --------------------------------------------------------------------------- //
+
+/// One step in a structural [`diff_runs`] comparison.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepDiff {
+    pub step: u64,
+    pub identical: bool,
+    pub note: String,
+}
+
+/// Structural diff of two runs by step index.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunDiff {
+    pub identical: bool,
+    pub a_count: u64,
+    pub b_count: u64,
+    pub steps: Vec<StepDiff>,
+}
+
+/// Compare two runs step-by-step (kind, match_key, request/response blobs).
+pub fn diff_runs(a: &RunReader, b: &RunReader) -> Result<RunDiff, AgentrrError> {
+    let ea = a.events()?;
+    let eb = b.events()?;
+    let max = ea.len().max(eb.len());
+    let mut steps = Vec::with_capacity(max);
+    let mut identical = ea.len() == eb.len();
+    for i in 0..max {
+        let step = i as u64;
+        match (ea.get(i), eb.get(i)) {
+            (Some(x), Some(y)) => {
+                let mut notes = Vec::new();
+                if x.kind != y.kind {
+                    notes.push(format!("kind {} vs {}", x.kind.as_str(), y.kind.as_str()));
+                }
+                if x.match_key != y.match_key {
+                    notes.push("match_key".into());
+                }
+                if x.request_blob != y.request_blob {
+                    notes.push("request_blob".into());
+                }
+                if x.response_blob != y.response_blob {
+                    notes.push("response_blob".into());
+                }
+                let same = notes.is_empty();
+                if !same {
+                    identical = false;
+                }
+                steps.push(StepDiff {
+                    step,
+                    identical: same,
+                    note: notes.join(", "),
+                });
+            }
+            (Some(x), None) => {
+                identical = false;
+                steps.push(StepDiff {
+                    step,
+                    identical: false,
+                    note: format!("only in A: {}", x.kind.as_str()),
+                });
+            }
+            (None, Some(y)) => {
+                identical = false;
+                steps.push(StepDiff {
+                    step,
+                    identical: false,
+                    note: format!("only in B: {}", y.kind.as_str()),
+                });
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(RunDiff {
+        identical,
+        a_count: ea.len() as u64,
+        b_count: eb.len() as u64,
+        steps,
     })
 }
 
@@ -806,5 +984,96 @@ mod tests {
             AgentrrError::RunNotFound(_) => {}
             other => panic!("expected RunNotFound, got {other:?}"),
         }
+    }
+
+    fn seed_parent(store: &Store, n: u64) -> RunId {
+        let manifest = RunManifest::new().unwrap();
+        let id = manifest.id;
+        let mut w = store.create_run(manifest).unwrap();
+        for i in 0..n {
+            let resp = w.store_blob(format!("resp{i}").as_bytes(), false).unwrap();
+            let mut ev = sample_event(EventKind::LlmCompletion, Some(&format!("key{i}")));
+            ev.response_blob = Some(resp);
+            ev.meta = serde_json::json!({"endpoint":"/e","provider":"openai"});
+            w.write_event(ev).unwrap();
+        }
+        w.finalize().unwrap();
+        id
+    }
+
+    #[test]
+    fn fork_shares_prefix_and_diverges_at_override() {
+        let (_td, store) = fresh_store();
+        let parent_id = seed_parent(&store, 3);
+
+        let fw = store
+            .fork_from(&parent_id, 1, Some(b"OVERRIDDEN"), None)
+            .unwrap();
+        let fork_id = fw.id();
+        fw.finalize().unwrap();
+
+        let pr = store.open_run(&parent_id).unwrap();
+        let fr = store.open_run(&fork_id).unwrap();
+        let pe = pr.events().unwrap();
+        let fe = fr.events().unwrap();
+
+        assert_eq!(fe.len(), 2, "fork = prefix[0] + override[1]");
+        // step 0: identical prefix
+        assert_eq!(fe[0].match_key, pe[0].match_key);
+        assert_eq!(fe[0].response_blob, pe[0].response_blob);
+        // step 1: same key (replay alignment), divergent response
+        assert_eq!(fe[1].match_key, pe[1].match_key);
+        assert_ne!(fe[1].response_blob, pe[1].response_blob);
+        assert_eq!(
+            &fr.read_blob(fe[1].response_blob.as_ref().unwrap()).unwrap(),
+            b"OVERRIDDEN"
+        );
+        // manifest records lineage
+        assert_eq!(fr.manifest().parent, Some(parent_id));
+        assert_eq!(fr.manifest().fork_at, Some(Step::new(1)));
+        // the fork is itself replayable + verifiable
+        let report = verify_run(&fr).unwrap();
+        assert_eq!(report.events, 2);
+    }
+
+    #[test]
+    fn fork_request_override_recomputes_match_key() {
+        let (_td, store) = fresh_store();
+        let parent_id = seed_parent(&store, 2);
+        // Replace step 1's request body; match_key should change.
+        let new_body = br#"{"model":"gpt","messages":[{"role":"user","content":"new"}]}"#;
+        let fw = store
+            .fork_from(&parent_id, 1, None, Some(new_body))
+            .unwrap();
+        let fork_id = fw.id();
+        fw.finalize().unwrap();
+
+        let pr = store.open_run(&parent_id).unwrap();
+        let fr = store.open_run(&fork_id).unwrap();
+        let pe = pr.events().unwrap();
+        let fe = fr.events().unwrap();
+        assert_eq!(fe[0].match_key, pe[0].match_key);
+        assert_ne!(
+            fe[1].match_key, pe[1].match_key,
+            "request override must change the key"
+        );
+    }
+
+    #[test]
+    fn diff_runs_detects_changes() {
+        let (_td, store) = fresh_store();
+        let parent_id = seed_parent(&store, 2);
+        let fw = store.fork_from(&parent_id, 1, Some(b"NEW"), None).unwrap();
+        let fork_id = fw.id();
+        fw.finalize().unwrap();
+
+        let a = store.open_run(&parent_id).unwrap();
+        let b = store.open_run(&fork_id).unwrap();
+        assert!(diff_runs(&a, &a).unwrap().identical);
+        let d = diff_runs(&a, &b).unwrap();
+        assert!(!d.identical);
+        assert!(d.steps[0].identical);
+        assert!(!d.steps[1].identical);
+        assert!(d.steps[1].note.contains("response_blob"));
     }
 }

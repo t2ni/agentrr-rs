@@ -78,6 +78,7 @@ dependencies = [
  "blake3",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

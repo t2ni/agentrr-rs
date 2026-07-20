@@ -143,3 +143,32 @@ fn verify_exits_3_on_corrupted_blob() {
     );
     assert_eq!(out.status.code(), Some(3));
 }
+
+#[test]
+fn diff_subcommand_reports_divergence() {
+    let td = TempDir::new().unwrap();
+    let parent = seed_run(td.path()); // 2 events
+
+    // Fork the parent at step 1 with an overridden response.
+    let store = Store::open(td.path()).unwrap();
+    let fw = store.fork_from(&parent.id, 1, Some(b"NEW"), None).unwrap();
+    let fork_id = fw.id();
+    fw.finalize().unwrap();
+
+    let out = agentrr(td.path())
+        .arg("diff")
+        .arg("--run")
+        .arg(parent.id.to_string())
+        .arg("--against")
+        .arg(fork_id.to_string())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["identical"], serde_json::Value::Bool(false));
+}

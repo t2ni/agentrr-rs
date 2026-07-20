@@ -130,6 +130,7 @@ async fn record_handler(
             let meta = build_meta(
                 req_json.as_ref(),
                 status,
+                path,
                 &resp_ct,
                 &provider,
                 started.elapsed().as_millis() as u64,
@@ -170,6 +171,7 @@ async fn collect_stream(
 fn build_meta(
     req_json: Option<&Value>,
     status: StatusCode,
+    endpoint: &str,
     resp_ct: &str,
     provider: &Provider,
     latency_ms: u64,
@@ -178,6 +180,7 @@ fn build_meta(
     let mut m = serde_json::json!({
         "model": req_json.and_then(|v| v.get("model")).and_then(|m| m.as_str()),
         "status": status.as_u16(),
+        "endpoint": endpoint,
         "latency_ms": latency_ms,
         "content_type": resp_ct,
         "provider": provider.as_str(),
@@ -449,6 +452,7 @@ async fn handle_miss(
                 let meta = build_meta(
                     req_json.as_ref(),
                     status,
+                    uri.path(),
                     &resp_ct,
                     provider,
                     started.elapsed().as_millis() as u64,
