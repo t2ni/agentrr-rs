@@ -131,6 +131,11 @@ enum Command {
         #[arg(value_name = "BUNDLE")]
         file: PathBuf,
     },
+    /// Print the env exports an agent should set to point at an agentrr proxy.
+    Env {
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -271,7 +276,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Diff { run, against } => cmd_diff(&store, &run, &against, cli.json),
         Command::Bundle { run, out, scrub } => cmd_bundle(&store, &run, &out, scrub),
         Command::Import { file } => cmd_import(&store, &file),
+        Command::Env { port } => {
+            cmd_env(port);
+            Ok(())
+        }
     }
+}
+
+fn cmd_env(port: u16) {
+    println!("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1");
+    println!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
 }
 
 async fn cmd_record(
