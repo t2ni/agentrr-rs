@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use agentrr_core::{Event, RunId, RunManifest};
-use agentrr_match::Provider;
-use agentrr_proxy::serve_record;
-use agentrr_store::Store;
+use agentrr_match::{MatchMode, Provider};
+use agentrr_proxy::{serve_record, serve_replay, OnMiss, ReplayConfig};
+use agentrr_store::{verify_run, Store};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -65,6 +65,27 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
         provider: ProviderArg,
     },
+    /// Replay a recorded run from cache (no network).
+    Replay {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// What to do on a cache miss.
+        #[arg(long, value_enum, default_value_t = OnMissArg::Strict)]
+        on_miss: OnMissArg,
+        /// Upstream origin for passthrough misses.
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Provider wire format.
+        #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
+        provider: ProviderArg,
+    },
+    /// Re-run a run against itself and assert byte-identical, deterministic replay.
+    Verify {
+        #[arg(long)]
+        run: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -91,32 +112,77 @@ impl ProviderArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum OnMissArg {
+    Strict,
+    Passthrough,
+}
+
+impl OnMissArg {
+    fn to_on_miss(self) -> OnMiss {
+        match self {
+            OnMissArg::Strict => OnMiss::Strict,
+            OnMissArg::Passthrough => OnMiss::Passthrough,
+        }
+    }
+}
+
+/// CLI-level error carrying a process exit code (0/1/2/3 — see `prompt.md` §5).
+enum CliError {
+    Other(anyhow::Error),
+    Code(u8, String),
+}
+
+impl From<anyhow::Error> for CliError {
+    fn from(e: anyhow::Error) -> Self {
+        CliError::Other(e)
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Err(CliError::Other(e)) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
+        }
+        Err(CliError::Code(code, msg)) => {
+            if !msg.is_empty() {
+                eprintln!("{msg}");
+            }
+            ExitCode::from(code)
         }
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli) -> Result<(), CliError> {
     let store_root = resolve_store(cli.store);
     let store = Store::open(&store_root)
         .with_context(|| format!("opening store at {}", store_root.display()))?;
     match cli.command {
-        Command::Ls => cmd_ls(&store, cli.json),
-        Command::Steps { run } => cmd_steps(&store, &run, cli.json),
-        Command::Show { run, step } => cmd_show(&store, &run, step, cli.json),
+        Command::Ls => cmd_ls(&store, cli.json).map_err(CliError::Other),
+        Command::Steps { run } => cmd_steps(&store, &run, cli.json).map_err(CliError::Other),
+        Command::Show { run, step } => {
+            cmd_show(&store, &run, step, cli.json).map_err(CliError::Other)
+        }
         Command::Record {
             upstream,
             port,
             name,
             provider,
-        } => cmd_record(&store, upstream, port, name, provider).await,
+        } => cmd_record(&store, upstream, port, name, provider)
+            .await
+            .map_err(CliError::Other),
+        Command::Replay {
+            run,
+            port,
+            on_miss,
+            upstream,
+            provider,
+        } => cmd_replay(&store, &run, port, on_miss, upstream, provider).await,
+        Command::Verify { run } => cmd_verify(&store, &run),
     }
 }
 
@@ -158,6 +224,83 @@ async fn cmd_record(
         run_dir.display()
     );
     Ok(())
+}
+
+async fn cmd_replay(
+    store: &Store,
+    run: &str,
+    port: u16,
+    on_miss: OnMissArg,
+    upstream: Option<String>,
+    provider: ProviderArg,
+) -> Result<(), CliError> {
+    let id = store.resolve(run).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upstream_url = match upstream {
+        Some(u) => Some(Url::parse(&u).map_err(|e| anyhow::anyhow!("upstream url: {e}"))?),
+        None => None,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| anyhow::anyhow!("bind 127.0.0.1:{port}: {e}"))?;
+
+    eprintln!(
+        "# replaying run {id} on http://127.0.0.1:{port} (on-miss={:?})",
+        on_miss
+    );
+    eprintln!("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1");
+    eprintln!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    eprintln!("# (Ctrl-C to stop)");
+
+    let outcome = serve_replay(
+        ReplayConfig {
+            store: store.clone(),
+            run_id: id,
+            on_miss: on_miss.to_on_miss(),
+            match_mode: MatchMode::Strict,
+            provider_override: provider.as_match(),
+            upstream: upstream_url,
+        },
+        listener,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!(
+        "# served {} requests, {} misses",
+        outcome.requests, outcome.misses
+    );
+    if outcome.misses > 0 && on_miss == OnMissArg::Strict {
+        return Err(CliError::Code(
+            2,
+            format!("cache miss in strict replay ({} misses)", outcome.misses),
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_verify(store: &Store, run: &str) -> Result<(), CliError> {
+    let id = store.resolve(run).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let reader = store.open_run(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    match verify_run(&reader) {
+        Ok(rep) => {
+            eprintln!(
+                "# verified: {} events, {} match keys — all blobs intact, FIFO self-consistent",
+                rep.events, rep.keys
+            );
+            Ok(())
+        }
+        Err(agentrr_core::AgentrrError::Verify { step, detail }) => Err(CliError::Code(
+            3,
+            format!("verify failed at step {step}: {detail}"),
+        )),
+        Err(agentrr_core::AgentrrError::CacheMiss(k)) => {
+            Err(CliError::Code(2, format!("verify miss: {k}")))
+        }
+        Err(e) => Err(CliError::Other(anyhow::anyhow!("{e}"))),
+    }
 }
 
 fn resolve_upstream(upstream: Option<String>, provider: ProviderArg) -> Result<Url> {

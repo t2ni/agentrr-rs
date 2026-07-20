@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentrr_core::{AgentrrError, Event, EventKind, RunId, RunManifest, Step, SCHEMA_VERSION};
+use agentrr_match::ReplayCursor;
 use regex::Regex;
 use rusqlite::{params, Connection};
 
@@ -32,7 +33,7 @@ use rusqlite::{params, Connection};
 // --------------------------------------------------------------------------- //
 
 /// The top-level store: a directory containing one subdir per run.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
 }
@@ -88,6 +89,37 @@ impl Store {
         }
         let conn = Connection::open(dir.join("events.sqlite")).map_err(sql_err)?;
         RunReader::new(dir, manifest, conn)
+    }
+
+    /// Reopen a finalized run for appending (used by `--on-miss passthrough` to
+    /// record additional events into the run being replayed). Continues step
+    /// numbering from where the run left off.
+    pub fn open_run_for_append(&self, id: &RunId) -> Result<RunWriter, AgentrrError> {
+        let dir = self.run_dir(id);
+        if !dir.exists() {
+            return Err(AgentrrError::RunNotFound(*id));
+        }
+        let manifest = read_manifest(&dir)?;
+        if manifest.schema_version != SCHEMA_VERSION {
+            return Err(AgentrrError::SchemaVersion {
+                store: manifest.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let db_path = dir.join("events.sqlite");
+
+        let conn = Connection::open(&db_path).map_err(sql_err)?;
+        // Idempotent: tables already exist (CREATE … IF NOT EXISTS).
+        conn.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
+        let max_step: i64 = conn
+            .query_row("SELECT COALESCE(MAX(step),-1) FROM events", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql_err)?;
+        let blobs_dir = dir.join("blobs");
+        let mut writer = RunWriter::new(dir, blobs_dir, conn, manifest)?;
+        writer.next_step = (max_step + 1).max(0) as u64;
+        Ok(writer)
     }
 
     /// Resolve `<RUN_ID|PATH>` against this store, returning a canonical run id.
@@ -547,6 +579,68 @@ impl Default for Redactor {
     fn default() -> Self {
         Self::default_secrets()
     }
+}
+
+// --------------------------------------------------------------------------- //
+// Verification (offline determinism self-check)
+// --------------------------------------------------------------------------- //
+
+/// Summary of a [`verify_run`] pass.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    pub events: usize,
+    pub keys: usize,
+}
+
+/// Verify a run is internally deterministic: every response blob hashes back to
+/// its content address, and every recorded request maps — through a fresh
+/// [`ReplayCursor`] — to itself in FIFO order. Returns [`AgentrrError::Verify`]
+/// on mismatch (the CLI maps this to exit code 3).
+pub fn verify_run(reader: &RunReader) -> Result<VerifyReport, AgentrrError> {
+    let events = reader.events()?;
+    let mut cursor = ReplayCursor::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for ev in &events {
+        // Blob integrity: the stored bytes must hash back to their address.
+        if let Some(hex) = &ev.response_blob {
+            let bytes = reader.read_blob(hex)?;
+            let actual = blake3::hash(&bytes).to_hex().to_string();
+            if actual != *hex {
+                return Err(AgentrrError::Verify {
+                    step: ev.step.get(),
+                    detail: format!("response blob {hex} corrupted (recomputed {actual})"),
+                });
+            }
+        }
+
+        // FIFO self-consistency: the k-th occurrence of a key must map to itself.
+        if let Some(key) = &ev.match_key {
+            seen.insert(key.clone());
+            let recorded = reader.events_for_key(key)?;
+            match cursor.next_index(key, recorded.len()) {
+                Some(i) => {
+                    if recorded[i].step != ev.step {
+                        return Err(AgentrrError::Verify {
+                            step: ev.step.get(),
+                            detail: format!(
+                                "FIFO misorder: key {} occurrence mapped to step {} (expected {})",
+                                &key[..key.len().min(12)],
+                                recorded[i].step.get(),
+                                ev.step.get()
+                            ),
+                        });
+                    }
+                }
+                None => return Err(AgentrrError::CacheMiss(key.clone())),
+            }
+        }
+    }
+
+    Ok(VerifyReport {
+        events: events.len(),
+        keys: seen.len(),
+    })
 }
 
 // --------------------------------------------------------------------------- //

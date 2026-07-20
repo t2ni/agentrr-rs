@@ -104,3 +104,42 @@ fn ls_empty_store_message() {
         .success()
         .stdout(predicates::str::contains("no runs"));
 }
+
+#[test]
+fn verify_exits_zero_on_good_run() {
+    let td = TempDir::new().unwrap();
+    let m = seed_run(td.path());
+    agentrr(td.path())
+        .arg("verify")
+        .arg("--run")
+        .arg(m.id.to_string())
+        .assert()
+        .success();
+}
+
+#[test]
+fn verify_exits_3_on_corrupted_blob() {
+    let td = TempDir::new().unwrap();
+    let m = seed_run(td.path());
+
+    // Corrupt the recorded response blob for step 0.
+    let store = Store::open(td.path()).unwrap();
+    let reader = store.open_run(&m.id).unwrap();
+    let ev = reader.event_at(0).unwrap().unwrap();
+    let hex = ev.response_blob.unwrap();
+    let blob_path = reader.blobs_dir().join(format!("{hex}.bin"));
+    drop(reader);
+    std::fs::write(&blob_path, b"corrupted-bytes").unwrap();
+
+    let out = agentrr(td.path())
+        .arg("verify")
+        .arg("--run")
+        .arg(m.id.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "verify should fail on corrupted blob"
+    );
+    assert_eq!(out.status.code(), Some(3));
+}

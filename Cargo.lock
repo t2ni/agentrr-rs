@@ -71,6 +71,7 @@ name = "agentrr-store"
 version = "0.1.0"
 dependencies = [
  "agentrr-core",
+ "agentrr-match",
  "blake3",
  "regex",
  "rusqlite",

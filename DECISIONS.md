@@ -40,3 +40,22 @@ sensibly... record the decision"). Newest at the bottom.
 ## D0008 — Ordering of identical requests
 - Per-`match_key` FIFO cursor (spec §7). The *k*-th live occurrence of a key
   returns the *k*-th recorded response. Exhausting occurrences = cache miss.
+
+## D0009 — Redaction vs. byte-exact replay (resolves a spec §9 tension)
+Spec §9 says both "store redacted bodies" *and* that replay reproduces the exact
+bytes. Redacting a **response** blob would mutate what replay serves, breaking
+determinism (the golden rule). Policy:
+- **Request blobs**: stored **redacted** — they are agent-authored (may carry
+  pasted secrets) and replay never re-sends them, so redaction cannot affect a
+  replay. `match_key` is still computed on the *unredacted* request (D0004).
+- **Response blobs**: stored **verbatim** — needed for byte-exact replay.
+- **Headers**: never stored (`Authorization`, `x-api-key`, cookies dropped before
+  any blob write); they are forwarded to the live upstream during recording only.
+- Residual-secret **scanning** over response blobs is a *warning* surface
+  (`bundle --scrub`, M8), not silent mutation.
+
+## D0010 — Strict-miss server behavior
+`--on-miss strict`: on a cache miss the proxy returns HTTP 502 to the client and
+**stops the server**, so the process exits with code 2 (spec §5). This is
+intentional "fail loudly" behavior — use `--on-miss passthrough` (with
+`--upstream`) to keep serving.
