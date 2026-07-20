@@ -1,12 +1,18 @@
 # agentrr
 
-> Deterministic record & replay for AI agents — `rr`/time-travel debugging, but for LLM agents.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey)](#)
+[![GitHub stars](https://img.shields.io/github/stars/t2ni/agentrr-rs?style=social)](https://github.com/t2ni/agentrr-rs/stargazers)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
+
+> **Deterministic record & replay for AI agents** — `rr` / time-travel debugging, but for LLM agents. Record once, replay forever: zero tokens, zero network, byte-for-byte identical.
 
 `agentrr` records every non-deterministic boundary of an AI-agent run (LLM
 completions, tool-call results, timestamps, random draws) and lets you **replay**
-the exact same run bit-for-bit from cache — zero tokens, zero network —
-**time-travel** to any step, **fork** an alternate branch, and **export** a
-self-contained bug bundle anyone can reproduce with one command.
+the exact same run bit-for-bit from cache — **time-travel** to any step, **fork**
+an alternate branch, and **export** a self-contained **bug bundle** anyone can
+reproduce with one command.
 
 It plugs into existing agents as an **OpenAI-/Anthropic-compatible reverse
 proxy**. Change one base URL, not your code.
@@ -17,6 +23,40 @@ proxy**. Change one base URL, not your code.
 - **Provider-agnostic.** OpenAI Chat Completions + Responses, Anthropic Messages,
   streaming and non-streaming.
 - Apache-2.0.
+
+---
+
+## Why?
+
+LLM agents are **non-deterministic**: the model returns different tokens each run,
+tools return different results, timestamps and seeds drift. So when an agent
+misbehaves once, you often can't reproduce it — which makes bugs in agent loops,
+prompt chains, and tool-calls painfully hard to debug and test.
+
+`agentrr` fixes that by capturing every non-deterministic boundary into a
+deterministic **cassette**, so a recorded run can be replayed **byte-identically,
+offline, for free**. Think of it as:
+
+- **`rr` / time-travel debugging, but for LLM agents**
+- **VCR / `vcrpy` / `nock` / `wiremock`, but provider-agnostic and byte-exact**
+- **`curl`-viz / proxy-style observability, with replay + fork**
+
+### Use cases
+
+- 🐛 **Reproduce flaky agent bugs** — record the failing run, share the `.agentrr`
+  bundle, anyone can replay it.
+- 🧪 **Test agent logic offline** — run your test suite against cached responses,
+  no API spend, no network flakiness.
+- ⏮ **Time-travel & fork** — step to any event, diff two runs, fork a branch by
+  editing a prompt/response.
+- 💸 **Save tokens** — iterate on agent code against a recording instead of the
+  live API.
+- 🔒 **Local-first & private** — nothing leaves your machine, no auth headers or
+  cookies are ever stored.
+
+> Works with **Claude Code, Cursor, Cline, Aider, LangGraph, LangChain, CrewAI,
+> AutoGen, OpenAI Agents SDK, Vercel AI SDK** and anything that speaks the
+> OpenAI or Anthropic HTTP API — via a single base-URL swap.
 
 ---
 
@@ -165,3 +205,13 @@ for byte-exact replay), and **no auth headers or cookies are ever stored.**
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE).
+
+---
+
+<sub>
+**Keywords:** record and replay · time-travel debugger · LLM agent testing ·
+deterministic AI · agent observability · cassette · mock server · API replay ·
+OpenAI proxy · Anthropic proxy · Claude Code debugging · LangGraph testing ·
+CrewAI testing · prompt regression testing · reproducible AI · byte-exact replay ·
+VCR for LLMs · Rust · axum · BLAKE3 · SQLite.
+</sub>
