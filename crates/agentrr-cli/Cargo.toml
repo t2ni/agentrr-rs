@@ -1,0 +1,15 @@
+[package]
+name = "agentrr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deterministic record & replay for AI agents"
+
+[[bin]]
+name = "agentrr"
+path = "src/main.rs"
+
+[dependencies]
