@@ -19,15 +19,20 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use agentrr_core::{AgentrrError, Event, EventKind, RunId, RunManifest, Step, SCHEMA_VERSION};
+use agentrr_core::{
+    AgentrrError, Event, EventKind, RunId, RunManifest, Step, SCHEMA_VERSION, TOOL_VERSION,
+};
 use agentrr_match::{match_key, MatchMode, Provider, ReplayCursor};
 use regex::Regex;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 // --------------------------------------------------------------------------- //
 // Store
@@ -195,6 +200,144 @@ impl Store {
             .and_then(|s| s.to_str())
             .ok_or_else(|| AgentrrError::InvalidRunId(run.to_string()))?;
         RunId::from_str(name)
+    }
+
+    /// Count blobs in a run that still contain a secret-shaped token (used to
+    /// warn before sharing a bundle). Request blobs are already redacted on
+    /// record, so this effectively scans verbatim response blobs.
+    pub fn count_secret_blobs(&self, id: &RunId) -> Result<usize, AgentrrError> {
+        let reader = self.open_run(id)?;
+        let redactor = Redactor::default_secrets();
+        let mut count = 0;
+        for ev in reader.events()? {
+            for hex in ev.request_blob.iter().chain(ev.response_blob.iter()) {
+                let bytes = reader.read_blob(hex)?;
+                if let Ok(s) = std::str::from_utf8(&bytes) {
+                    if redactor.redact_str(s) != s {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Bundle a run into a portable `.agentrr` zip. With `scrub`, residual
+    /// secrets in blobs are redacted (note: a scrubbed bundle is no longer
+    /// byte-exact-replayable — that's the privacy tradeoff).
+    pub fn bundle(
+        &self,
+        id: &RunId,
+        out: &Path,
+        scrub: bool,
+    ) -> Result<BundleManifest, AgentrrError> {
+        let run_manifest = {
+            let reader = self.open_run(id)?;
+            reader.manifest().clone()
+        };
+        let run_dir = self.run_dir(id);
+        let blobs_dir = run_dir.join("blobs");
+        let redactor = Redactor::default_secrets();
+
+        let file = File::create(out)?;
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        // Run manifest at the archive root.
+        zip.start_file("manifest.json", opts).map_err(zip_err)?;
+        zip.write_all(&serde_json::to_vec_pretty(&run_manifest)?)?;
+
+        // events.sqlite verbatim.
+        zip.start_file("events.sqlite", opts).map_err(zip_err)?;
+        let db = fs::read(run_dir.join("events.sqlite"))?;
+        zip.write_all(&db)?;
+
+        // Blobs (optionally scrubbed in-place under their original filename).
+        let mut blob_count = 0u64;
+        if blobs_dir.exists() {
+            let mut entries: Vec<PathBuf> = fs::read_dir(&blobs_dir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect();
+            entries.sort();
+            for path in entries {
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| AgentrrError::Other("non-utf8 blob name".into()))?;
+                let mut bytes = fs::read(&path)?;
+                if scrub {
+                    bytes = redactor.redact_bytes(&bytes)?;
+                }
+                zip.start_file(format!("blobs/{name}"), opts)
+                    .map_err(zip_err)?;
+                zip.write_all(&bytes)?;
+                blob_count += 1;
+            }
+        }
+
+        let bundle_manifest = BundleManifest {
+            format: "agentrr-bundle".into(),
+            format_version: 1,
+            tool_version: TOOL_VERSION.to_string(),
+            run_id: *id,
+            created_at: run_manifest.created_at.clone(),
+            scrubbed: scrub,
+            schema_version: run_manifest.schema_version,
+            event_count: run_manifest.event_count,
+            blob_count,
+        };
+        zip.start_file("bundle.json", opts).map_err(zip_err)?;
+        zip.write_all(&serde_json::to_vec_pretty(&bundle_manifest)?)?;
+        zip.finish().map_err(zip_err)?;
+        Ok(bundle_manifest)
+    }
+
+    /// Import a `.agentrr` bundle into this store. Returns the imported run id.
+    pub fn import(&self, bundle: &Path) -> Result<RunId, AgentrrError> {
+        let file = File::open(bundle)?;
+        let mut zip = ZipArchive::new(file).map_err(zip_err)?;
+
+        let bm: BundleManifest = read_zip_json(&mut zip, "bundle.json")
+            .or_else(|_| read_zip_json(&mut zip, "manifest.json"))?;
+        if bm.schema_version != SCHEMA_VERSION {
+            return Err(AgentrrError::SchemaVersion {
+                store: bm.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let run_id = bm.run_id;
+        let dest = self.run_dir(&run_id);
+        if dest.exists() {
+            return Err(AgentrrError::Other(format!(
+                "run already exists in store: {}",
+                dest.display()
+            )));
+        }
+        fs::create_dir_all(dest.join("blobs"))?;
+
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(zip_err)?;
+            let name = entry.name().to_string();
+            if name == "bundle.json" {
+                continue;
+            }
+            let rel = sanitize_zip_path(&name)?;
+            let out_path = dest.join(rel);
+            if entry.is_dir() {
+                fs::create_dir_all(&out_path)?;
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut buf)?;
+            fs::write(&out_path, &buf)?;
+        }
+        Ok(run_id)
     }
 
     /// List manifests for every run in the store, oldest first (UUIDv7 order).
@@ -539,6 +682,37 @@ fn sql_err(e: rusqlite::Error) -> AgentrrError {
     AgentrrError::Sqlite(e.to_string())
 }
 
+fn zip_err(e: zip::result::ZipError) -> AgentrrError {
+    AgentrrError::Other(format!("zip: {e}"))
+}
+
+fn read_zip_json<T: serde::de::DeserializeOwned>(
+    zip: &mut ZipArchive<File>,
+    name: &str,
+) -> Result<T, AgentrrError> {
+    let mut entry = zip.by_name(name).map_err(zip_err)?;
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf)?;
+    drop(entry);
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Reject zip entries that escape the destination directory (path traversal).
+fn sanitize_zip_path(name: &str) -> Result<PathBuf, AgentrrError> {
+    let p = Path::new(name);
+    if p.is_absolute() {
+        return Err(AgentrrError::Other(format!(
+            "refusing absolute zip entry: {name}"
+        )));
+    }
+    for c in p.components() {
+        if matches!(c, Component::ParentDir | Component::Prefix(_)) {
+            return Err(AgentrrError::Other(format!("unsafe zip entry: {name}")));
+        }
+    }
+    Ok(p.to_path_buf())
+}
+
 fn unix_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -675,6 +849,24 @@ impl Default for Redactor {
     fn default() -> Self {
         Self::default_secrets()
     }
+}
+
+// --------------------------------------------------------------------------- //
+// Bundle manifest
+// --------------------------------------------------------------------------- //
+
+/// Top-level descriptor written to `bundle.json` inside an `.agentrr` archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleManifest {
+    pub format: String,
+    pub format_version: u32,
+    pub tool_version: String,
+    pub run_id: RunId,
+    pub created_at: String,
+    pub scrubbed: bool,
+    pub schema_version: u32,
+    pub event_count: u64,
+    pub blob_count: u64,
 }
 
 // --------------------------------------------------------------------------- //
@@ -1075,5 +1267,62 @@ mod tests {
         assert!(d.steps[0].identical);
         assert!(!d.steps[1].identical);
         assert!(d.steps[1].note.contains("response_blob"));
+    }
+
+    #[test]
+    fn bundle_then_import_verifies() {
+        let (td, store) = fresh_store();
+        let parent_id = seed_parent(&store, 2);
+        let bundle_path = td.path().join("run.agentrr");
+        let bm = store.bundle(&parent_id, &bundle_path, false).unwrap();
+        assert_eq!(bm.run_id, parent_id);
+        assert!(!bm.scrubbed);
+        assert!(bundle_path.exists());
+
+        let td2 = TempDir::new().unwrap();
+        let store2 = Store::open(td2.path()).unwrap();
+        let imported = store2.import(&bundle_path).unwrap();
+        assert_eq!(imported, parent_id);
+
+        let reader = store2.open_run(&imported).unwrap();
+        verify_run(&reader).unwrap();
+        assert_eq!(reader.events().unwrap().len(), 2);
+        let ev = reader.events().unwrap()[0].clone();
+        assert_eq!(
+            &reader
+                .read_blob(ev.response_blob.as_ref().unwrap())
+                .unwrap(),
+            b"resp0"
+        );
+    }
+
+    #[test]
+    fn bundle_scrub_redacts_response_secrets() {
+        let (td, store) = fresh_store();
+        let m = RunManifest::new().unwrap();
+        let id = m.id;
+        let mut w = store.create_run(m).unwrap();
+        let secret = b"{\"key\":\"sk-01234567890123456789abc\"}";
+        let hex = w.store_blob(secret, false).unwrap();
+        let mut ev = sample_event(EventKind::LlmCompletion, Some("k"));
+        ev.response_blob = Some(hex);
+        ev.meta = serde_json::json!({"endpoint":"/e","provider":"openai"});
+        w.write_event(ev).unwrap();
+        w.finalize().unwrap();
+
+        assert!(store.count_secret_blobs(&id).unwrap() >= 1);
+
+        let out = td.path().join("s.agentrr");
+        let bm = store.bundle(&id, &out, true).unwrap();
+        assert!(bm.scrubbed);
+
+        let td2 = TempDir::new().unwrap();
+        let s2 = Store::open(td2.path()).unwrap();
+        let imported = s2.import(&out).unwrap();
+        let r = s2.open_run(&imported).unwrap();
+        let ev = r.events().unwrap()[0].clone();
+        let bytes = r.read_blob(ev.response_blob.as_ref().unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("sk-01234567890123456789abc"));
+        assert!(String::from_utf8_lossy(&bytes).contains("[REDACTED]"));
     }
 }

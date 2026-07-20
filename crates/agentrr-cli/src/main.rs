@@ -115,6 +115,22 @@ enum Command {
         #[arg(long)]
         against: String,
     },
+    /// Export a run to a portable .agentrr zip bundle.
+    Bundle {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        out: PathBuf,
+        /// Redact residual secrets before zipping (makes the bundle non-replayable).
+        #[arg(long, default_value_t = false)]
+        scrub: bool,
+    },
+    /// Import a .agentrr bundle into the store.
+    Import {
+        /// Path to the .agentrr bundle.
+        #[arg(value_name = "BUNDLE")]
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -253,6 +269,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .await
         }
         Command::Diff { run, against } => cmd_diff(&store, &run, &against, cli.json),
+        Command::Bundle { run, out, scrub } => cmd_bundle(&store, &run, &out, scrub),
+        Command::Import { file } => cmd_import(&store, &file),
     }
 }
 
@@ -467,6 +485,33 @@ fn cmd_diff(store: &Store, a: &str, b: &str, json: bool) -> Result<(), CliError>
     } else {
         println!("{t}");
     }
+    Ok(())
+}
+
+fn cmd_bundle(store: &Store, run: &str, out: &Path, scrub: bool) -> Result<(), CliError> {
+    let id = store.resolve(run)?;
+    if !scrub {
+        let n = store.count_secret_blobs(&id)?;
+        if n > 0 {
+            eprintln!("# WARNING: {n} blob(s) contain potential secret-shaped tokens.");
+            eprintln!("#          Re-run with --scrub to redact before sharing.");
+        }
+    }
+    let bm = store.bundle(&id, out, scrub)?;
+    println!(
+        "bundled run {} -> {} ({} events, {} blobs, scrubbed={})",
+        bm.run_id,
+        out.display(),
+        bm.event_count,
+        bm.blob_count,
+        bm.scrubbed
+    );
+    Ok(())
+}
+
+fn cmd_import(store: &Store, file: &Path) -> Result<(), CliError> {
+    let id = store.import(file)?;
+    println!("imported run {id} from {}", file.display());
     Ok(())
 }
 

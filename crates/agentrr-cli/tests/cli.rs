@@ -172,3 +172,41 @@ fn diff_subcommand_reports_divergence() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["identical"], serde_json::Value::Bool(false));
 }
+
+#[test]
+fn bundle_import_subcommands_round_trip() {
+    let td = TempDir::new().unwrap();
+    let m = seed_run(td.path());
+    let bundle_path = td.path().join("r.agentrr");
+
+    agentrr(td.path())
+        .arg("bundle")
+        .arg("--run")
+        .arg(m.id.to_string())
+        .arg("--out")
+        .arg(&bundle_path)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("bundled"));
+    assert!(bundle_path.exists());
+
+    // Import into a fresh store, then verify there.
+    let td2 = TempDir::new().unwrap();
+    let out = agentrr(td2.path())
+        .arg("import")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    agentrr(td2.path())
+        .arg("verify")
+        .arg("--run")
+        .arg(m.id.to_string())
+        .assert()
+        .success();
+}
