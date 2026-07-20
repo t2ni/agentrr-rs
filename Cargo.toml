@@ -53,6 +53,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 regex = "1"
+unicode-normalization = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 

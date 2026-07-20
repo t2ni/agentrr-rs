@@ -1,0 +1,5 @@
+---
+source: crates/agentrr-match/src/lib.rs
+expression: "canonical_json(&v, MatchMode::Strict)"
+---
+{"q":"élan"}

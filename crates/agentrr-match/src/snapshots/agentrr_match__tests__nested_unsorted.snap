@@ -1,0 +1,5 @@
+---
+source: crates/agentrr-match/src/lib.rs
+expression: "canonical_json(&v, MatchMode::Strict)"
+---
+{"a":1,"b":2,"messages":[{"content":"hi","role":"user"}],"model":"gpt-4","nested":{"x":[3,2,1],"y":1}}
