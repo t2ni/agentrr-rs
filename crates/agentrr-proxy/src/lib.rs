@@ -95,10 +95,7 @@ async fn record_handler(
     let path = uri.path();
 
     let req_json: Option<Value> = serde_json::from_slice(&body).ok();
-    let provider = state
-        .provider_override
-        .clone()
-        .unwrap_or_else(|| Provider::from_endpoint(path));
+    let provider = detect_provider(state.provider_override.as_ref(), path, &headers);
     let key = match_key_from(&provider, path, &body, req_json.as_ref(), MatchMode::Strict);
     let req_bytes = body.clone();
 
@@ -344,10 +341,7 @@ async fn replay_handler(
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let path = uri.path();
     let req_json: Option<Value> = serde_json::from_slice(&body).ok();
-    let provider = state
-        .provider_override
-        .clone()
-        .unwrap_or_else(|| Provider::from_endpoint(path));
+    let provider = detect_provider(state.provider_override.as_ref(), path, &headers);
     let key = match_key_from(&provider, path, &body, req_json.as_ref(), state.match_mode);
     state.requests.fetch_add(1, Ordering::Relaxed);
 
@@ -502,6 +496,23 @@ async fn forward_upstream(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("read upstream: {e}")))?;
     Ok((status, hdrs, bytes))
+}
+
+/// Resolve the provider for a request: explicit override wins, else path-based
+/// detection, else header hints (`anthropic-version` ⇒ Anthropic). Used by both
+/// record and replay so the match key is consistent across the two passes.
+fn detect_provider(override_: Option<&Provider>, path: &str, headers: &HeaderMap) -> Provider {
+    if let Some(p) = override_ {
+        return p.clone();
+    }
+    let by_path = Provider::from_endpoint(path);
+    if !matches!(by_path, Provider::Other(_)) {
+        return by_path;
+    }
+    if headers.contains_key("anthropic-version") {
+        return Provider::Anthropic;
+    }
+    by_path
 }
 
 fn match_key_from(
@@ -959,5 +970,208 @@ mod tests {
             );
             assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
         }
+    }
+
+    // ------------------------------------------------------------------ //
+    // Anthropic /v1/messages (provider auto-detect + wire format)
+    // ------------------------------------------------------------------ //
+
+    fn anthropic_req() -> serde_json::Value {
+        json!({
+            "model":"claude-3",
+            "max_tokens":16,
+            "system":"be brief",
+            "messages":[{"role":"user","content":"hi"}]
+        })
+    }
+
+    async fn record_anthropic(
+        upstream_uri: &str,
+        store_root: &Path,
+        body_json: serde_json::Value,
+    ) -> (
+        RunId,
+        tokio::task::JoinHandle<()>,
+        Bytes,
+        std::net::SocketAddr,
+    ) {
+        let store = Store::open(store_root).unwrap();
+        let writer = store.create_run(RunManifest::new().unwrap()).unwrap();
+        let run_id = writer.id();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_url = Url::parse(upstream_uri).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = serve_record(upstream_url, None, listener, writer, async move {
+                let _ = rx.await;
+            })
+            .await;
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "sk-ant-testsecret0123456789012")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body_json)
+            .send()
+            .await
+            .unwrap();
+        let served = resp.bytes().await.unwrap();
+        let _ = tx.send(());
+        (run_id, handle, served, addr)
+    }
+
+    #[tokio::test]
+    async fn anthropic_non_stream_round_trip() {
+        let mock = MockServer::start().await;
+        let canned = json!({
+            "id":"msg_1","type":"message","role":"assistant",
+            "content":[{"type":"text","text":"hi"}],
+            "model":"claude-3","stop_reason":"end_turn"
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(canned))
+            .mount(&mock)
+            .await;
+
+        let td = TempDir::new().unwrap();
+        let (run_id, handle, served, _addr) =
+            record_anthropic(&mock.uri(), td.path(), anthropic_req()).await;
+        handle.await.unwrap();
+
+        // Recorded: provider auto-detected as anthropic; no secret stored.
+        let store = Store::open(td.path()).unwrap();
+        let reader = store.open_run(&run_id).unwrap();
+        let ev = reader.events().unwrap().into_iter().next().unwrap();
+        assert_eq!(ev.meta["provider"], "anthropic");
+        assert_eq!(
+            &reader
+                .read_blob(ev.response_blob.as_ref().unwrap())
+                .unwrap()[..],
+            &served[..]
+        );
+        for hex in ev.request_blob.iter().chain(ev.response_blob.iter()) {
+            let b = reader.read_blob(hex).unwrap();
+            assert!(!String::from_utf8_lossy(&b).contains("sk-ant-testsecret"));
+        }
+
+        // Replay byte-identical.
+        let s = Store::open(td.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            serve_replay(
+                ReplayConfig {
+                    store: s,
+                    run_id,
+                    on_miss: OnMiss::Strict,
+                    match_mode: MatchMode::Strict,
+                    provider_override: None,
+                    upstream: None,
+                    realtime: false,
+                },
+                listener,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await
+        });
+        let replayed = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "sk-ant-testsecret0123456789012")
+            .header("anthropic-version", "2023-06-01")
+            .json(&anthropic_req())
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let _ = tx.send(());
+        join.await.unwrap().unwrap();
+        assert_eq!(
+            &replayed[..],
+            &served[..],
+            "anthropic replay must be byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_round_trip() {
+        let sse: &[u8] = b"event: content_block_delta\ndata: {\"type\":\"text_delta\",\"text\":\"a\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse.to_vec(), "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let td = TempDir::new().unwrap();
+        let mut req = anthropic_req();
+        req["stream"] = json!(true);
+        let (run_id, handle, _served, _) = record_anthropic(&mock.uri(), td.path(), req).await;
+        handle.await.unwrap();
+
+        let store = Store::open(td.path()).unwrap();
+        let reader = store.open_run(&run_id).unwrap();
+        let ev = reader.events().unwrap().into_iter().next().unwrap();
+        assert!(ev.is_stream);
+        assert_eq!(ev.meta["provider"], "anthropic");
+        assert_eq!(
+            &reader
+                .read_blob(ev.response_blob.as_ref().unwrap())
+                .unwrap()[..],
+            sse
+        );
+
+        // Replay the stream byte-identical.
+        let s = Store::open(td.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            serve_replay(
+                ReplayConfig {
+                    store: s,
+                    run_id,
+                    on_miss: OnMiss::Strict,
+                    match_mode: MatchMode::Strict,
+                    provider_override: None,
+                    upstream: None,
+                    realtime: false,
+                },
+                listener,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await
+        });
+        let mut replay_req = anthropic_req();
+        replay_req["stream"] = json!(true);
+        let replayed = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&replay_req)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let _ = tx.send(());
+        join.await.unwrap().unwrap();
+        assert_eq!(
+            &replayed[..],
+            sse,
+            "anthropic stream replay must be byte-identical"
+        );
     }
 }
