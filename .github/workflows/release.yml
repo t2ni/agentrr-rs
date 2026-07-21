@@ -24,7 +24,9 @@ jobs:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, artifact: agentrr-x86_64-linux,    archive: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   artifact: agentrr-x86_64-windows, archive: zip }
-          - { os: macos-13,       target: x86_64-apple-darwin,       artifact: agentrr-x86_64-macos,   archive: tar.gz }
+          # Both macOS targets cross-compile on the Apple-Silicon runner — avoids
+          # the retired Intel macos-13 runners that hang "waiting for runner".
+          - { os: macos-latest,   target: x86_64-apple-darwin,      artifact: agentrr-x86_64-macos,   archive: tar.gz }
           - { os: macos-latest,   target: aarch64-apple-darwin,      artifact: agentrr-aarch64-macos,  archive: tar.gz }
     steps:
       - uses: actions/checkout@v4
