@@ -3,7 +3,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey)](#)
-[![GitHub stars](https://img.shields.io/github/stars/t2ni/agentrr-rs?style=social)](https://github.com/t2ni/agentrr-rs/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/t2ni/agentrr?style=social)](https://github.com/t2ni/agentrr/stargazers)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
 > **Deterministic record & replay for AI agents** — `rr` / time-travel debugging, but for LLM agents. Record once, replay forever: zero tokens, zero network, byte-for-byte identical.
